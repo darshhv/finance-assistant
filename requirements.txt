@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+newspaper3k
+streamlit
+pyttsx3
+speechrecognition
+plotly
+streamlit-lottie
+finnhub-python
