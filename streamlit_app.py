@@ -1,176 +1,179 @@
+import os
+import uuid
+import shutil
 import streamlit as st
 import requests
-import speech_recognition as sr
-import pyttsx3
 from datetime import datetime
+from gtts import gTTS
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+import queue
+import numpy as np
+import google.generativeai as genai
 
-# Page Configuration
-st.set_page_config(
-    page_title="Multi-Agent Finance Assistant",
-    layout="wide",
-    initial_sidebar_state="auto"
-)
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
-# Custom CSS for design
-st.markdown("""
-    <style>
-    .stApp { font-family: 'Arial', sans-serif; color: #333; }
-    .header-title { font-size: 2.5rem; font-weight: 700; margin-bottom: 0; }
-    .header-subtitle { font-size: 1.2rem; color: #555; margin-top: 0; margin-bottom: 1.5rem; }
-    .mic-button > button {
-        font-size: 2rem;
-        padding: 1rem;
-        border-radius: 50%;
-        background-color: #4CAF50;
-        color: white;
-    }
-    .mic-button > button:focus { outline: 3px solid #FFEB3B; }
-    .listening { color: #E53935; font-weight: bold; animation: pulse 1s infinite; }
-    @keyframes pulse {
-        0% { opacity: 1; }
-        50% { opacity: 0.5; }
-        100% { opacity: 1; }
-    }
-    .news-container {
-        max-height: 300px;
-        overflow-y: auto;
-        padding-right: 1rem;
-    }
-    </style>
-""", unsafe_allow_html=True)
+# Configure keys and Gemini
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Functions
-def fetch_market_data(symbol: str, source: str = "finnhub") -> dict:
-    url = f"http://127.0.0.1:8000/stock/{source}?symbol={symbol}"
-    resp = requests.get(url, timeout=5)
-    resp.raise_for_status()
-    return resp.json()
+genai.configure(api_key=GEMINI_API_KEY)
 
-def fetch_latest_news() -> list:
-    url = "http://127.0.0.1:8001/latest_news"
-    resp = requests.get(url, timeout=5)
-    resp.raise_for_status()
-    return resp.json().get("articles", [])
+# Check available models
+try:
+    models = genai.list_models()
+except Exception as e:
+    models = []
+st.write("Available Gemini models:", models)
+
+# Choose a valid Gemini model or fallback
+valid_models = [m.name for m in models]
+model_name = "models/text-bison-001" if "models/text-bison-001" in valid_models else valid_models[0] if valid_models else None
+
+if not model_name:
+    st.error("No valid Gemini models found! Cannot generate summaries.")
+else:
+    model = genai.GenerativeModel(model_name)
+
+# Setup tmp folder for audio files
+TMP_AUDIO_DIR = "./tmp_audio"
+os.makedirs(TMP_AUDIO_DIR, exist_ok=True)
+
+# Clear old temp files on start (optional, to avoid clutter)
+for f in os.listdir(TMP_AUDIO_DIR):
+    try:
+        os.remove(os.path.join(TMP_AUDIO_DIR, f))
+    except:
+        pass
+
+# Audio queue for mic input (basic)
+audio_queue = queue.Queue()
+
+class AudioProcessor(AudioProcessorBase):
+    def recv(self, frame):
+        audio = frame.to_ndarray(format="flt32")
+        # Put audio data in queue for future processing (optional)
+        audio_queue.put(audio)
+        return frame
 
 def speak_text(text: str):
-    engine = pyttsx3.init()
-    engine.setProperty('rate', 150)
-    voices = engine.getProperty('voices')
-    if len(voices) > 1:
-        engine.setProperty('voice', voices[1].id)
-    engine.say(text)
-    engine.runAndWait()
+    filename = os.path.join(TMP_AUDIO_DIR, f"voice_{uuid.uuid4()}.mp3")
+    tts = gTTS(text)
+    tts.save(filename)
+    st.audio(filename, format="audio/mp3")
 
-# Session States
-if "listening" not in st.session_state:
-    st.session_state.listening = False
-if "query" not in st.session_state:
-    st.session_state.query = ""
-if "tts_enabled" not in st.session_state:
-    st.session_state.tts_enabled = True
-if "source" not in st.session_state:
-    st.session_state.source = "finnhub"
+def fetch_market_data(symbol: str, source: str) -> dict:
+    try:
+        if source == "alphavantage":
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHAVANTAGE_API_KEY}"
+            r = requests.get(url)
+            data = r.json().get("Global Quote", {})
+            return {
+                "symbol": symbol,
+                "current": float(data.get("05. price", 0)),
+                "open": float(data.get("02. open", 0)),
+                "high": float(data.get("03. high", 0)),
+                "low": float(data.get("04. low", 0)),
+                "previous_close": float(data.get("08. previous close", 0)),
+                "timestamp": datetime.now().timestamp()
+            }
+        else:
+            url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+            r = requests.get(url)
+            data = r.json()
+            return {
+                "symbol": symbol,
+                "current": data.get("c", 0),
+                "open": data.get("o", 0),
+                "high": data.get("h", 0),
+                "low": data.get("l", 0),
+                "previous_close": data.get("pc", 0),
+                "timestamp": datetime.now().timestamp()
+            }
+    except Exception as e:
+        return {"error": str(e)}
 
-# Header
-st.markdown('<h1 class="header-title">💹 Multi-Agent Finance Assistant</h1>', unsafe_allow_html=True)
-st.markdown('<p class="header-subtitle">Speak or type to get real-time market briefs and latest financial news.</p>', unsafe_allow_html=True)
+def fetch_latest_news():
+    try:
+        url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&apiKey={NEWS_API_KEY}"
+        r = requests.get(url)
+        return r.json().get("articles", [])
+    except Exception as e:
+        return []
 
-# Input UI
-col1, col2, col3 = st.columns([1, 4, 2], gap="small")
+def summarize_with_gemini(prompt):
+    if not model_name:
+        return "No Gemini model available."
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Gemini failed: {e}"
 
-with col1:
-    st.markdown('<div class="mic-button">', unsafe_allow_html=True)
-    if st.button("🎙️"):
-        st.session_state.listening = True
-        recognizer = sr.Recognizer()
-        with sr.Microphone() as source:
-            audio_placeholder = st.empty()
-            audio_placeholder.markdown('<p class="listening">Listening...</p>', unsafe_allow_html=True)
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
-            audio_placeholder.empty()
-        try:
-            text = recognizer.recognize_google(audio)
-            st.session_state.query = text
-            st.session_state.query_input = text
-        except Exception:
-            st.error("Voice recognition failed. Please try again.")
-        st.session_state.listening = False
-    st.markdown('</div>', unsafe_allow_html=True)
+# Streamlit UI
+st.title("🎤 Multi-Agent Finance Assistant with Mic & Gemini")
 
-with col2:
-    st.text_input(
-        "Enter your question or symbol(s)",
-        placeholder="e.g. AAPL, TSLA, BTC",
-        key="query_input",
-        on_change=lambda: st.session_state.update({"query": st.session_state.query_input})
+with st.sidebar:
+    source = st.selectbox("Select Market Data Source", ["finnhub", "alphavantage"])
+    st.markdown("---")
+    enable_tts = st.checkbox("Enable Speech Playback", value=True)
+    st.markdown("---")
+    mic_on = st.checkbox("Enable Microphone Input (Basic)", value=True)
+
+if mic_on:
+    webrtc_streamer(
+        key="mic-stream",
+        audio_processor_factory=AudioProcessor,
+        media_stream_constraints={"audio": True, "video": False},
+        async_processing=True,
     )
 
-with col3:
-    st.selectbox("Select Data Source", ["finnhub", "alphavantage"], key="source")
+query = st.text_input("Enter stock symbols (comma separated), or your query")
 
-# Results
-if st.session_state.query:
-    st.markdown("### 🧠 Your Query")
-    st.write(st.session_state.query)
-
-    symbols = [s.strip().upper() for s in st.session_state.query.split(",") if s.strip()]
-    st.markdown("### 📊 Market Brief Response")
-
-    for symbol in symbols:
-        try:
-            with st.spinner(f"Fetching market data for {symbol}..."):
-                data = fetch_market_data(symbol, st.session_state.source)
-
-            with st.container():
-                st.markdown(f"**{symbol}**")
-                market_info = {
-                    "Symbol": data.get("symbol", "").upper(),
-                    "Current": f"${data.get('current', 0):,.2f}",
-                    "Open": f"${data.get('open', 0):,.2f}",
-                    "High": f"${data.get('high', 0):,.2f}",
-                    "Low": f"${data.get('low', 0):,.2f}",
-                    "Previous Close": f"${data.get('previous_close', 0):,.2f}",
-                }
-                st.table(market_info)
-
-                ts = data.get("timestamp")
-                if ts:
-                    st.caption(f"Last updated: {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}")
-
-                if st.session_state.tts_enabled:
-                    speech_text = (
-                        f"{symbol} current price is {data.get('current')} dollars. "
-                        f"High {data.get('high')}, low {data.get('low')}, open {data.get('open')}, "
-                        f"previous close {data.get('previous_close')}."
-                    )
-                    speak_text(speech_text)
-
-        except requests.HTTPError as e:
-            st.error(f"Failed to fetch market data for {symbol}: {e}")
-        except Exception as e:
-            st.error(f"Unexpected error fetching data for {symbol}: {e}")
-
-    st.checkbox("🔊 Enable Speech Playback", value=st.session_state.tts_enabled, key="tts_enabled")
-
-# News Section
-st.markdown("---")
-st.markdown("### 🗞️ Latest Market News")
-try:
-    with st.spinner("Loading latest news..."):
-        articles = fetch_latest_news()
-
-    if not articles:
-        st.info("No news available at the moment.")
+if st.button("Fetch Market Data & Summary"):
+    if not query.strip():
+        st.warning("Please enter some stock symbols or query")
     else:
-        st.markdown('<div class="news-container">', unsafe_allow_html=True)
-        for art in articles:
-            title = art.get("title", "No title")
-            desc = art.get("description") or "No description available."
-            url = art.get("url", "#")
-            st.markdown(f"**{title}**  \n{desc}  \n[Read more ▶]({url})\n\n---")
-        st.markdown('</div>', unsafe_allow_html=True)
+        symbols = [s.strip().upper() for s in query.split(",") if s.strip()]
+        for symbol in symbols:
+            with st.spinner(f"Fetching data for {symbol}..."):
+                data = fetch_market_data(symbol, source)
+                if "error" in data:
+                    st.error(f"Error fetching {symbol}: {data['error']}")
+                    continue
+                st.markdown(f"### {symbol}")
+                st.table({
+                    "Symbol": data["symbol"],
+                    "Current": f"${data['current']:.2f}",
+                    "Open": f"${data['open']:.2f}",
+                    "High": f"${data['high']:.2f}",
+                    "Low": f"${data['low']:.2f}",
+                    "Previous Close": f"${data['previous_close']:.2f}",
+                })
+                if enable_tts:
+                    speak_text(
+                        f"{symbol} is trading at ${data['current']:.2f}. "
+                        f"Open: {data['open']:.2f}, High: {data['high']:.2f}, "
+                        f"Low: {data['low']:.2f}, Previous Close: {data['previous_close']:.2f}."
+                    )
 
-except requests.HTTPError as e:
-    st.error(f"Failed to load news: {e}")
-except Exception as e:
-    st.error(f"An unexpected error occurred: {e}")
+        # Gemini summary of all symbols
+        prompt = f"Provide a short financial summary for these stocks: {', '.join(symbols)}."
+        summary = summarize_with_gemini(prompt)
+        st.markdown("### 🧠 AI Summary")
+        st.write(summary)
+        if enable_tts:
+            speak_text(summary)
+
+st.markdown("---")
+st.markdown("### 📰 Latest Business News")
+articles = fetch_latest_news()
+if not articles:
+    st.info("No news available right now.")
+else:
+    for art in articles[:5]:
+        st.markdown(f"**{art.get('title')}**  \n{art.get('description','')}  \n[Read more ▶]({art.get('url')})")
+        st.markdown("---")
